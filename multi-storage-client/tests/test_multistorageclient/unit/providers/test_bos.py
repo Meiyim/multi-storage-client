@@ -21,11 +21,16 @@ from multistorageclient.providers.bos import PROVIDER, BaiduBosStorageProvider
 
 
 def _make_provider(**kwargs) -> tuple[BaiduBosStorageProvider, MagicMock]:
-    """Construct a bosfs-backed provider with bosfs.BOSFileSystem mocked out (no network)."""
+    """Construct a bosfs-backed provider with bosfs.BOSFileSystem mocked out (no network).
+
+    The backend is built lazily, so we force it inside the patch context (via
+    backend_name) to capture the mocked filesystem.
+    """
     kwargs.setdefault("backend", "bosfs")
     fs = MagicMock(name="BOSFileSystem")
     with patch("bosfs.BOSFileSystem", return_value=fs) as ctor:
         provider = BaiduBosStorageProvider(base_path="my-bucket", **kwargs)
+        assert provider.backend_name == "bosfs"  # forces lazy backend build under the patch
     provider._ctor = ctor  # type: ignore[attr-defined]
     return provider, fs
 
@@ -121,7 +126,7 @@ def test_backend_defaults_to_go_when_available():
     fake_go.name = "go"
     with patch("multistorageclient.providers.bos._BosGoBackend", return_value=fake_go) as go_ctor:
         provider = BaiduBosStorageProvider(base_path="my-bucket")  # backend defaults to "auto"
-    assert provider.backend_name == "go"
+        assert provider.backend_name == "go"  # lazy build under the patch
     go_ctor.assert_called_once()
 
 
@@ -133,11 +138,32 @@ def test_backend_auto_falls_back_to_bosfs_when_go_unavailable():
         patch("bosfs.BOSFileSystem", return_value=fs),
     ):
         provider = BaiduBosStorageProvider(base_path="my-bucket", backend="auto")
-    assert provider.backend_name == "bosfs"
+        assert provider.backend_name == "bosfs"
 
 
 def test_backend_go_forced_raises_when_unavailable():
     """backend='go' surfaces the error instead of silently falling back."""
     with patch("multistorageclient.providers.bos._BosGoBackend", side_effect=ImportError("no bos_tool")):
         with pytest.raises(ImportError):
-            BaiduBosStorageProvider(base_path="my-bucket", backend="go")
+            BaiduBosStorageProvider(base_path="my-bucket", backend="go").backend_name
+
+
+def test_backend_fork_safe_parent_uses_bosfs_child_uses_go():
+    """fork_safe: the main/parent pid uses bosfs; a (simulated) forked child builds Go."""
+    fs = MagicMock(name="BOSFileSystem")
+    fake_go = MagicMock(name="GoBackendInstance")
+    fake_go.name = "go"
+    with (
+        patch("multistorageclient.providers.bos._BosGoBackend", return_value=fake_go) as go_ctor,
+        patch("bosfs.BOSFileSystem", return_value=fs),
+    ):
+        provider = BaiduBosStorageProvider(base_path="my-bucket", backend="fork_safe")
+        # Parent (creation pid) must NOT start the Go runtime.
+        assert provider.backend_name == "bosfs"
+        go_ctor.assert_not_called()
+
+        # Simulate a forked child by flipping the recorded main pid, then rebuild.
+        provider._main_pid = provider._main_pid + 1
+        provider._reset_backend_cache()
+        assert provider.backend_name == "go"
+        go_ctor.assert_called_once()
