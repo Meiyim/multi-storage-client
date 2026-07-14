@@ -42,6 +42,8 @@ def __getattr__(name: str) -> Any:
         "GoogleIdentityPoolCredentialsProvider": ".gcs",
         "GoogleServiceAccountCredentialsProvider": ".gcs",
         "GoogleS3StorageProvider": ".gcs_s3",
+        # BOS
+        "BaiduBosStorageProvider": ".bos",
         # Oracle
         "OracleStorageProvider": ".oci",
         # S3
@@ -73,6 +75,7 @@ def __getattr__(name: str) -> Any:
                 ".azure": ["azure-storage-blob"],
                 ".gcs": ["google-cloud-storage"],
                 ".gcs_s3": ["boto3"],
+                ".bos": ["bos-tool-go (preferred) or bosfs"],
                 ".oci": ["oci"],
                 ".s3": ["boto3"],
                 ".s8k": ["boto3"],
@@ -88,6 +91,7 @@ def __getattr__(name: str) -> Any:
                 ".azure": "Azure Blob Storage",
                 ".gcs": "Google Cloud Storage",
                 ".gcs_s3": "Google Cloud Storage with S3 API",
+                ".bos": "Baidu Object Storage",
                 ".oci": "Oracle Cloud Infrastructure",
                 ".s3": "Amazon S3 or other S3-compatible storage",
                 ".s8k": "S8K storage",

@@ -52,12 +52,13 @@ from .types import (
 from .utils import expand_env_vars, import_class, merge_dictionaries_no_overwrite
 
 # Constants related to implicit profiles
-SUPPORTED_IMPLICIT_PROFILE_PROTOCOLS = ("s3", "gs", "ais", "file")
+SUPPORTED_IMPLICIT_PROFILE_PROTOCOLS = ("s3", "gs", "ais", "file", "bos")
 PROTOCOL_TO_PROVIDER_TYPE_MAPPING = {
     "s3": "s3",
     "gs": "gcs",
     "ais": "ais",
     "file": "file",
+    "bos": "bos",
 }
 
 
@@ -91,6 +92,7 @@ STORAGE_PROVIDER_MAPPING = {
     "ais_s3": "AIStoreS3StorageProvider",
     "s8k": "S8KStorageProvider",
     "gcs_s3": "GoogleS3StorageProvider",
+    "bos": "BaiduBosStorageProvider",
     "huggingface": "HuggingFaceStorageProvider",
 }
 
