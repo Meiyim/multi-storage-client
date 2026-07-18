@@ -550,6 +550,57 @@ def test_cache_manager_refresh_cache(tmpdir):
     shutil.rmtree(cache_dir)
 
 
+@pytest.mark.skipif(
+    not os.path.isdir("/dev/shm") or not os.access("/dev/shm", os.W_OK),
+    reason="tmpfs (/dev/shm) not available",
+)
+def test_tmpfs_eviction_bounds_cache_with_purge_factor(profile_name):
+    """Eviction on a RAM-resident (tmpfs) cache must bound the cache to the purge target.
+
+    Mirrors the offline-cook config: a /dev/shm cache with FIFO eviction and a
+    purge_factor headroom. When the cache is over-filled well past its size cap, a
+    refresh pass must evict down to ``size * (1 - purge_factor/100)`` (not merely to
+    the cap) so tmpfs usage stays bounded with headroom. Guards the exact invariant
+    the cook relies on to keep /dev/shm from filling.
+    """
+    cache_dir = os.path.join("/dev/shm", f"msc_evict_test_{uuid.uuid4().hex}")
+    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        cap_mb = 10
+        purge_factor = 50
+        cache_config = CacheConfig(
+            size=f"{cap_mb}M",
+            cache_line_size="64M",
+            check_source_version=False,
+            location=cache_dir,
+            eviction_policy=EvictionPolicyConfig(policy="fifo", purge_factor=purge_factor),
+        )
+        cache_manager = CacheManager(profile=profile_name, cache_config=cache_config)
+
+        # Over-fill 4x past the cap (40 MB into a 10 MB cache).
+        one_mb = b"x" * (1024 * 1024)
+        for i in range(4 * cap_mb):
+            cache_manager.set(f"evict/file_{i:03d}.bin", one_mb)
+        assert cache_manager.cache_size() > cap_mb * 1024 * 1024, "precondition: cache over-filled"
+
+        # Force a synchronous eviction pass.
+        cache_manager._last_refresh_time = datetime.now() - timedelta(
+            seconds=cache_manager._cache_refresh_interval + 1
+        )
+        cache_manager.refresh_cache()
+
+        size_after = cache_manager.cache_size()
+        cap_bytes = cap_mb * 1024 * 1024
+        target_bytes = cap_bytes * (1 - purge_factor / 100.0)  # 5 MB
+        # Never exceed the cap, and purge_factor must drop it to ~the target (+1 file slack).
+        assert size_after <= cap_bytes, f"cache {size_after} still exceeds cap {cap_bytes}"
+        assert size_after <= target_bytes + 1024 * 1024, (
+            f"purge_factor={purge_factor} should evict to ~{target_bytes} bytes, got {size_after}"
+        )
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 def test_chunk_write_schedules_refresh(tmpdir, monkeypatch):
     cache_manager = CacheManager(
         profile="test",

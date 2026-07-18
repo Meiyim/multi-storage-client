@@ -22,7 +22,7 @@ import os
 import tempfile
 import threading
 from collections.abc import Iterator
-from io import BytesIO, IOBase, StringIO
+from io import BufferedReader, BytesIO, IOBase, StringIO
 from typing import IO, TYPE_CHECKING, Any, Optional, cast
 
 import xattr
@@ -38,6 +38,16 @@ if TYPE_CHECKING:
     from .client.types import AbstractStorageClient
 
 logger = logging.getLogger(__name__)
+
+# Read-ahead buffer size wrapped around a streaming reader, so many small sequential
+# reads (e.g. tarfile 512-byte headers) coalesce into fewer range GETs. The whole-vs-
+# stream decision itself is governed by MEMORY_LOAD_LIMIT (see constants.py).
+# Tuned to 1M for the BOS/webdataset cook workload: a sweep at max_tar_handles=500 showed
+# 256K-1M is a flat throughput plateau (~6.5 B tok/hr/node), while larger buffers over-fetch
+# on random-access reads and multiply into huge RAM (buffer_size x open handles): 16M used
+# ~1.5TB and 128M/512M OOM'd. 0 (no read-ahead) collapses to a tiny-GET storm. See
+# outputs/ra_sweep and outputs/mll_sweep reports.
+STREAM_READAHEAD_BYTES = 1 * 1024 * 1024
 
 
 class RemoteFileReader(IO[bytes]):
@@ -305,8 +315,22 @@ class ObjectFile(IOBase, IO):
                 # Read
                 self._object_metadata = self._storage_client.info(self._remote_path)
                 self._download_complete = threading.Event()
-                self._download_thread = threading.Thread(target=self._download_fileobj)
-                self._download_thread.start()
+                # Honor the memory-load threshold even without a cache manager: stream
+                # objects >= memory_load_limit via RemoteFileReader (ranged get_object)
+                # instead of loading the whole object into an in-memory BytesIO. Without
+                # this, cache-less profiles buffer whole objects in RAM — e.g. webdataset
+                # tar shards (tens–hundreds of MB), which blows up DataLoader-worker
+                # memory. Smaller objects and text mode still load fully.
+                if self._mode == "rb" and self._object_metadata.content_length >= self._memory_load_limit:
+                    self._open_large_file()
+                    # Wrap in a read-ahead buffer so tarfile's many small sequential
+                    # reads don't each become a tiny range GET.
+                    if STREAM_READAHEAD_BYTES > 0 and isinstance(self._file, RemoteFileReader):
+                        self._file = BufferedReader(cast(Any, self._file), buffer_size=STREAM_READAHEAD_BYTES)
+                        self._open_files.append(self._file)
+                else:
+                    self._download_thread = threading.Thread(target=self._download_fileobj)
+                    self._download_thread.start()
             else:
                 # Write or append
                 self._create_fileobj()

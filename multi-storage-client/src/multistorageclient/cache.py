@@ -161,6 +161,8 @@ class CacheManager:
         Evict cache entries based on the configured eviction policy.
         """
         logging.debug("\nStarting evict_files...")
+        _pid = os.getpid()
+        _t_scan0 = time.time()
         cache_items: list[CacheItem] = []
 
         # Traverse the directory and subdirectories
@@ -184,6 +186,7 @@ class CacheManager:
                     # Ignore if file has already been evicted
                     pass
 
+        _scan_dt = time.time() - _t_scan0
         logging.debug(f"\nFound {len(cache_items)} files before sorting")
 
         # Sort items according to eviction policy
@@ -209,6 +212,10 @@ class CacheManager:
 
         # Evict files to reduce cache size to target_size
         # Once eviction is triggered, evict down to target_size (not just to max_cache_size)
+        _size_before = cache_size
+        _evicted = 0
+        _freed = 0
+        _t_evict0 = time.time()
         if cache_size > self._max_cache_size:
             logging.debug(
                 f"Cache size {cache_size} exceeds max {self._max_cache_size}, starting eviction to target {target_size}"
@@ -217,8 +224,22 @@ class CacheManager:
                 # Pop the first item in the OrderedDict (according to policy's sorting)
                 file_to_evict, file_size = cache.popitem(last=False)
                 cache_size -= file_size
+                _evicted += 1
+                _freed += file_size
                 logging.debug(f"Evicting file: {file_to_evict}, size: {file_size}, remaining: {cache_size}")
                 self._delete_cache_file_at_path(file_to_evict)
+
+        # [CACHE_EVICT] one-line summary so we can see, per eviction pass: how long the
+        # dir scan took (grows with #chunks), the size the cache had reached BEFORE eviction
+        # (the overshoot vs max), how much was evicted, and the final size. If size_before
+        # keeps climbing far above max across passes, eviction is not keeping pace with fill.
+        _GB = 1024**3
+        logging.warning(
+            "[CACHE_EVICT pid=%d] scan=%.2fs files=%d size_before=%.2fGB max=%.2fGB target=%.2fGB "
+            "evicted=%d freed=%.2fGB size_after=%.2fGB evict=%.2fs",
+            _pid, _scan_dt, len(cache_items), _size_before / _GB, self._max_cache_size / _GB,
+            target_size / _GB, _evicted, _freed / _GB, cache_size / _GB, time.time() - _t_evict0,
+        )
 
         logging.debug("\nFinal cache contents:")
         for file_path in cache.keys():
@@ -415,12 +436,23 @@ class CacheManager:
                 self._last_refresh_time = datetime.now()
                 return True
 
+            _since = (datetime.now() - self._last_refresh_time).total_seconds()
             # If the process acquires the lock, then proceed with the cache eviction
             with self._cache_refresh_lock_file.acquire(blocking=False):
+                # [CACHE_EVICT] this process WON the single global refresh lock and will
+                # run the (serial) eviction. Only one process across all workers evicts at
+                # a time; `since` shows how long since this process last refreshed.
+                logging.warning(
+                    "[CACHE_EVICT pid=%d] acquired refresh lock (%.1fs since last) -> evicting", os.getpid(), _since
+                )
                 self.evict_files()
                 self._last_refresh_time = datetime.now()
                 return True
         except Timeout:
+            # [CACHE_EVICT] another process holds the single refresh lock, so this one skips
+            # entirely. If most attempts skip, eviction is effectively single-threaded and
+            # cannot keep up with 128 workers filling the cache.
+            logging.warning("[CACHE_EVICT pid=%d] refresh lock held by another process -> skip", os.getpid())
             # If the process cannot acquire the lock, ignore and wait for the next turn
             pass
 
@@ -497,6 +529,12 @@ class CacheManager:
 
         with self._cache_refresh_thread_lock:
             if self._cache_refresh_thread and self._cache_refresh_thread.is_alive():
+                # [CACHE_EVICT] this process's previous eviction pass is STILL running, so
+                # a new one can't be scheduled. Frequent hits here mean eviction (scan+delete)
+                # is slower than the refresh interval => it falls behind the fill rate.
+                logging.warning(
+                    "[CACHE_EVICT pid=%d] previous refresh thread still running -> skip scheduling", os.getpid()
+                )
                 return
 
             thread = threading.Thread(target=self._run_refresh_cache, daemon=True)
