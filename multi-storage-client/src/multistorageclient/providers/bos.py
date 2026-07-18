@@ -166,6 +166,50 @@ class _BosfsBackend:
             sts_token=token,
             **kwargs,
         )
+        self._install_direct_info()
+
+    def _install_direct_info(self):
+        """Replace the bosfs instance's listing-based info() with a direct HEAD.
+
+        fsspec's info() lists the parent directory (delimiter mode) to locate the
+        entry, which inherits BOS's page-boundary pagination bug: an object landing
+        on a max_keys boundary is invisible to the listing, so info() wrongly raises
+        FileNotFoundError. open()/cat_file()/get_file() all call info() for the object
+        size, so every read of such an object fails -- not just head().
+
+        A direct get_object_meta_data is O(1) and exact. Prefixes legitimately 404
+        here, so we fall back to the original listing-based info() to preserve
+        directory semantics (type="directory").
+        """
+        from baidubce.exception import BceError
+
+        fs = self._fs
+        orig_info = fs.info
+
+        def direct_info(path, **kwargs):
+            norm = fs._strip_protocol(path).strip("/")
+            bucket, _, key = norm.partition("/")
+            if key:
+                try:
+                    meta = fs._get_client().get_object_meta_data(bucket, key).metadata
+                    return {
+                        "name": norm,
+                        "size": int(getattr(meta, "content_length", 0) or 0),
+                        "type": "file",
+                        "LastModified": getattr(meta, "last_modified", None),
+                        "ETag": getattr(meta, "etag", None),
+                    }
+                except BceError as error:
+                    status = getattr(error, "status_code", None) or getattr(
+                        getattr(error, "last_error", None), "status_code", None
+                    )
+                    if status != 404 and not _looks_like_not_found(str(error)):
+                        raise
+                    # 404: not a real object -- may be a prefix/directory. Fall back
+                    # to the listing-based info() so directories still resolve.
+            return orig_info(path, **kwargs)
+
+        fs.info = direct_info
 
     @staticmethod
     def _full(bucket, key):
@@ -192,14 +236,30 @@ class _BosfsBackend:
         self._fs.get_file(self._full(bucket, key), local_path)
 
     def head(self, bucket, key):
-        info = self._fs.info(self._full(bucket, key))  # raises FileNotFoundError if missing
+        # Direct object metadata (true HEAD). We deliberately avoid self._fs.info(),
+        # which is listing-based (fsspec ls of the parent dir) and therefore inherits
+        # BOS's delimiter-mode pagination bug: a real object landing on a max_keys
+        # page boundary is invisible to the listing, so info() wrongly raises
+        # FileNotFoundError. get_object_meta_data is O(1) and exact. Prefixes 404 here
+        # (like the native backend); _get_object_metadata resolves directories via
+        # its own _is_dir fallback.
+        from baidubce.exception import BceError
+
+        try:
+            resp = self._fs._get_client().get_object_meta_data(bucket, key)
+        except BceError as error:
+            status = getattr(error, "status_code", None) or getattr(
+                getattr(error, "last_error", None), "status_code", None
+            )
+            if status == 404 or _looks_like_not_found(str(error)):
+                raise FileNotFoundError(f"bos://{bucket}/{key}") from error
+            raise RuntimeError(f"HEAD failed for bos://{bucket}/{key}: {error}") from error
+        meta = resp.metadata
         return {
-            # bosfs returns type="directory" for prefixes; carry it through so the
-            # provider doesn't misreport a directory as a file.
-            "type": "directory" if info.get("type") == "directory" else "file",
-            "size": int(info.get("size") or 0),
-            "last_modified": info.get("LastModified"),
-            "etag": info.get("ETag"),
+            "type": "file",
+            "size": int(getattr(meta, "content_length", 0) or 0),
+            "last_modified": getattr(meta, "last_modified", None),
+            "etag": getattr(meta, "etag", None),
         }
 
     def list_page(self, bucket, prefix, delimiter, marker, max_keys):
@@ -210,7 +270,13 @@ class _BosfsBackend:
             if delimiter:
                 infos = list(self._fs.ls(full, detail=True))
             else:
-                infos = list(self._fs.find(full, detail=True).values())
+                # NOTE: fsspec find()/ls() list in *directory mode* (delimiter="/").
+                # BOS mis-paginates delimiter-mode listings at the max_keys (1000)
+                # boundary: it silently drops objects that straddle a page boundary
+                # (the 1001st key resumes past a key that page 1 never returned).
+                # The flat accumulator lists with delimiter="" (like the native
+                # backend), which paginates correctly and returns the complete set.
+                infos = self._fs._get_object_info_list(bucket, prefix, "")
         except FileNotFoundError:
             return [], False, ""
 

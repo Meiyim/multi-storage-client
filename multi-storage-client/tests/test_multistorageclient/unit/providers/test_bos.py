@@ -97,11 +97,14 @@ def test_bos_symlink_not_supported():
 
 def test_bos_list_objects_recursive_yields_files_sorted():
     provider, fs = _make_provider()
-    fs.find.return_value = {
-        "my-bucket/b.txt": {"name": "my-bucket/b.txt", "type": "file", "size": 2},
-        "my-bucket/a.txt": {"name": "my-bucket/a.txt", "type": "file", "size": 1},
-        "my-bucket/sub": {"name": "my-bucket/sub", "type": "directory", "size": 0},
-    }
+    # Recursive listing goes through bosfs's flat page accumulator (delimiter="")
+    # rather than fsspec find() (delimiter="/"). See
+    # test_bos_recursive_listing_uses_flat_accumulator_not_find for why.
+    fs._get_object_info_list.return_value = [
+        {"name": "my-bucket/b.txt", "type": "file", "size": 2},
+        {"name": "my-bucket/a.txt", "type": "file", "size": 1},
+        {"name": "my-bucket/sub", "type": "directory", "size": 0},
+    ]
 
     keys = [m.key for m in provider._list_objects("my-bucket")]
 
@@ -111,9 +114,9 @@ def test_bos_list_objects_recursive_yields_files_sorted():
 
 def test_bos_list_objects_start_after_and_end_at():
     provider, fs = _make_provider()
-    fs.find.return_value = {
-        f"my-bucket/{n}": {"name": f"my-bucket/{n}", "type": "file", "size": 1} for n in ("a", "b", "c", "d")
-    }
+    fs._get_object_info_list.return_value = [
+        {"name": f"my-bucket/{n}", "type": "file", "size": 1} for n in ("a", "b", "c", "d")
+    ]
 
     keys = [m.key for m in provider._list_objects("my-bucket", start_after="my-bucket/a", end_at="my-bucket/c")]
 
@@ -167,3 +170,121 @@ def test_backend_fork_safe_parent_uses_bosfs_child_uses_go():
         provider._reset_backend_cache()
         assert provider.backend_name == "go"
         go_ctor.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Regression: BOS delimiter-mode pagination drops page-boundary objects.
+#
+# BOS's list_objects, when issued with a delimiter ("/"), mis-paginates at the
+# max_keys page boundary and silently omits an object that straddles it (the
+# key at the start of the second page can be skipped while its neighbours are
+# fine). fsspec find()/ls() and the listing-based info() all issue delimiter-mode
+# lists, so both recursive listing and HEAD inherited the blind spot. The provider
+# must instead use the flat (delimiter="") accumulator for listing and a direct
+# object-metadata call for HEAD, neither of which hits the bug.
+# ---------------------------------------------------------------------------
+
+
+def test_bos_recursive_listing_uses_flat_accumulator_not_find():
+    """Recursive listing must use the flat delimiter="" accumulator, never find()."""
+    provider, fs = _make_provider()
+    # Simulate the bug: delimiter-mode find() drops a boundary key; the flat
+    # accumulator returns the complete set.
+    fs.find.side_effect = AssertionError(
+        "find() lists in delimiter mode and drops page-boundary objects; "
+        "recursive listing must use _get_object_info_list(delimiter='')"
+    )
+    fs._get_object_info_list.return_value = [
+        {"name": "my-bucket/obj-a", "type": "file", "size": 1},
+        {"name": "my-bucket/obj-b", "type": "file", "size": 2},
+        {"name": "my-bucket/obj-boundary", "type": "file", "size": 3},  # the boundary victim
+        {"name": "my-bucket/obj-c", "type": "file", "size": 4},
+    ]
+
+    keys = [m.key for m in provider._list_objects("my-bucket")]
+
+    # The previously-dropped boundary object is present, and find() was not used.
+    assert "my-bucket/obj-boundary" in keys
+    assert keys == ["my-bucket/obj-a", "my-bucket/obj-b", "my-bucket/obj-boundary", "my-bucket/obj-c"]
+    fs._get_object_info_list.assert_called_once()
+    assert fs._get_object_info_list.call_args.args[2] == ""  # delimiter is empty (flat)
+
+
+def test_bos_head_uses_direct_metadata_not_listing_info():
+    """HEAD must use a direct object-metadata request, not listing-based info()."""
+    provider, fs = _make_provider()
+    meta = MagicMock(content_length=123, etag="deadbeef", last_modified=None)
+    fs._get_client.return_value.get_object_meta_data.return_value = MagicMock(metadata=meta)
+
+    md = provider._get_object_metadata("my-bucket/obj-boundary")
+
+    assert md.type == "file"
+    assert md.content_length == 123
+    assert md.etag == "deadbeef"
+    # head() goes straight to get_object_meta_data -- it never issues a listing.
+    fs._get_client.return_value.get_object_meta_data.assert_called_once_with("my-bucket", "obj-boundary")
+
+
+def test_bos_head_missing_object_raises_filenotfound():
+    """A genuine 404 from the metadata request maps to FileNotFoundError."""
+    from baidubce.exception import BceError
+
+    provider, fs = _make_provider()
+    err = BceError("The specified key does not exist.")
+    err.status_code = 404  # type: ignore[attr-defined]
+    fs._get_client.return_value.get_object_meta_data.side_effect = err
+
+    with pytest.raises(FileNotFoundError):
+        provider._get_object_metadata("my-bucket/does-not-exist")
+
+
+def test_bos_info_uses_direct_head_not_listing():
+    """fs.info() must resolve real objects via a direct HEAD, never a listing.
+
+    open()/get_range()/get_bytes()/download_file() all call fs.info() for the
+    object size, so a listing-based info() (which drops page-boundary objects)
+    breaks every read of such an object, not just head().
+    """
+    from multistorageclient.providers.bos import _BosfsBackend
+
+    fs = MagicMock(name="BOSFileSystem")
+    fs._strip_protocol.side_effect = lambda p: p
+    fs.info.side_effect = AssertionError("listing-based info() must not be used for real objects")
+    meta = MagicMock(content_length=7, etag="abc", last_modified="ts")
+    fs._get_client.return_value.get_object_meta_data.return_value = MagicMock(metadata=meta)
+
+    with patch("bosfs.BOSFileSystem", return_value=fs):
+        backend = _BosfsBackend("ak", "sk", "tok", "http://bj.bcebos.com")
+
+    info = backend._fs.info("my-bucket/obj-boundary")
+
+    assert info == {
+        "name": "my-bucket/obj-boundary",
+        "size": 7,
+        "type": "file",
+        "LastModified": "ts",
+        "ETag": "abc",
+    }
+    backend._fs._get_client.return_value.get_object_meta_data.assert_called_once_with(
+        "my-bucket", "obj-boundary"
+    )
+
+
+def test_bos_info_falls_back_to_listing_for_prefix():
+    """A 404 (prefix/directory, not a real object) falls back to listing-based info."""
+    from baidubce.exception import BceError
+
+    from multistorageclient.providers.bos import _BosfsBackend
+
+    fs = MagicMock(name="BOSFileSystem")
+    fs._strip_protocol.side_effect = lambda p: p
+    sentinel = {"name": "my-bucket/dir", "type": "directory", "size": 0}
+    fs.info.return_value = sentinel  # original listing-based info (captured at install)
+    err = BceError("The specified key does not exist.")
+    err.status_code = 404  # type: ignore[attr-defined]
+    fs._get_client.return_value.get_object_meta_data.side_effect = err
+
+    with patch("bosfs.BOSFileSystem", return_value=fs):
+        backend = _BosfsBackend("ak", "sk", "tok", "http://bj.bcebos.com")
+
+    assert backend._fs.info("my-bucket/dir") == sentinel
